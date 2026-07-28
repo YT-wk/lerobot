@@ -84,6 +84,9 @@ class TrainPipelineConfig(HubMixin):
     # Set `dir` to where you would like to save all of the run outputs. If you run another training session
     # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
     output_dir: Path | None = None
+    # Distributed actor processes attach to an output directory owned by the
+    # learner. Regular training keeps the default False to prevent overwrite.
+    allow_existing_output_dir: bool = False
     job_name: str | None = None
     # Set `resume` to true to resume a previous run. Pass `--config_path` pointing at either a local
     # checkpoint's train_config.json or a Hub repo id holding `checkpoints/<step>/` subtrees (the
@@ -251,7 +254,12 @@ class TrainPipelineConfig(HubMixin):
             else:
                 self.job_name = f"{self.env.type}_{active_cfg.type}"
 
-        if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
+        if (
+            not self.resume
+            and not self.allow_existing_output_dir
+            and isinstance(self.output_dir, Path)
+            and self.output_dir.is_dir()
+        ):
             raise FileExistsError(
                 f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
                 f"Please change your output directory so that {self.output_dir} is not overwritten."

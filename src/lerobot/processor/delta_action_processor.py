@@ -97,7 +97,9 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
         delta_x = action.pop("delta_x")
         delta_y = action.pop("delta_y")
         delta_z = action.pop("delta_z")
-        gripper = action.pop("gripper")
+        # Policies without a gripper produce a 3-D delta action. Keep the downstream
+        # robot-action contract stable by treating the missing gripper as a no-op.
+        gripper = action.pop("gripper", 1.0)
 
         # Determine if the teleoperator is actively providing input
         # Consider enabled if any significant movement delta is detected

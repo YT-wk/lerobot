@@ -20,6 +20,7 @@ from .config_so_leader import (
     SOLeaderConfig,
     SOLeaderTeleopConfig,
 )
+from .hil_so101_leader import HILSO101Leader
 from .so_leader import SO100Leader, SO101Leader, SOLeader
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     "SOLeader",
     "SOLeaderConfig",
     "SOLeaderTeleopConfig",
+    "HILSO101Leader",
 ]

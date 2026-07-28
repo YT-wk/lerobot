@@ -14,9 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 import numpy as np
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
 
 from lerobot.types import EnvTransition, PolicyAction, TransitionKey
 
+from .hil_diagnostics import update_hil_diagnostics
 from .pipeline import (
     ComplementaryDataProcessorStep,
     InfoProcessorStep,
@@ -43,6 +45,10 @@ from .pipeline import (
 GRIPPER_KEY = "gripper"
 DISCRETE_PENALTY_KEY = "discrete_penalty"
 TELEOP_ACTION_KEY = "teleop_action"
+DIRECT_JOINT_ACTION_KEY = "hil_direct_joint_action"
+
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -68,6 +74,24 @@ class HasTeleopEvents(Protocol):
             - `rerecord_episode`: bool - Whether to rerecord the episode.
         """
         ...
+
+
+@runtime_checkable
+class HILLeader(HasTeleopEvents, Protocol):
+    """Capability contract for leader devices used by the HIL pipeline.
+
+    The raw leader hardware is intentionally not specified here. A leader only
+    needs to expose its raw joint action, one-shot HIL events, and the methods
+    needed to enter and leave policy-following mode.
+    """
+
+    def get_action(self) -> dict[str, float]: ...
+
+    def update_policy_tracking(self, follower_positions: dict[str, float]) -> None: ...
+
+    def stop_policy_tracking(self) -> None: ...
+
+    def reset_episode(self) -> None: ...
 
 
 # Type variable constrained to Teleoperator subclasses that also implement events
@@ -167,6 +191,554 @@ class AddTeleopEventsAsInfoStep(InfoProcessorStep):
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register("leader_policy_tracking_processor")
+class LeaderPolicyTrackingProcessorStep(ProcessorStep):
+    """Coordinate any capable leader's feedback with HIL intervention state."""
+
+    teleop_device: Any
+    enabled: bool = True
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        info = transition.get(TransitionKey.INFO, {})
+        is_intervention = bool(info.get(TeleopEvents.IS_INTERVENTION, False))
+        observation = transition.get(TransitionKey.OBSERVATION) or {}
+
+        try:
+            if is_intervention or not self.enabled:
+                self.teleop_device.stop_policy_tracking()
+            else:
+                self.teleop_device.update_policy_tracking(observation)
+        except Exception as exc:
+            # The next processor frame will carry the failure event; do not
+            # continue forcing a leader that has lost its feedback channel.
+            logger.exception("Leader policy tracking failed: %s", exc)
+            report_failure = getattr(self.teleop_device, "report_failure", None)
+            if report_failure is not None:
+                report_failure()
+            try:
+                self.teleop_device.stop_policy_tracking()
+            except Exception:
+                logger.exception("Unable to stop leader policy tracking after failure.")
+        return transition
+
+    def reset(self) -> None:
+        self.teleop_device.stop_policy_tracking()
+        self.teleop_device.reset_episode()
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register("leader_joint_delta_action_processor")
+class LeaderJointDeltaActionProcessorStep(ProcessorStep):
+    """Convert calibrated leader joint motion into HIL-SERL Cartesian deltas."""
+
+    kinematics: Any
+    motor_names: list[str]
+    end_effector_step_sizes: dict[str, float]
+    use_gripper: bool = True
+    gripper_deadband: float = 0.5
+    gripper_open_on_positive_delta: bool = True
+    leader_action_joint_names: list[str] | None = None
+    joint_scales: dict[str, float] | None = None
+    joint_offsets_deg: dict[str, float] | None = None
+    leader_to_follower_rotation: list[list[float]] | np.ndarray | None = None
+    gripper_action_key: str = "gripper.pos"
+    diagnostics_enabled: bool = False
+
+    _previous_position: np.ndarray | None = None
+    _previous_gripper: float | None = None
+    _was_intervening: bool = False
+
+    def __post_init__(self) -> None:
+        action_joint_names = self.leader_action_joint_names or self.motor_names
+        if len(action_joint_names) != len(self.motor_names):
+            raise ValueError(
+                "leader_action_joint_names must have the same length as the leader kinematic joint list."
+            )
+        rotation = self.leader_to_follower_rotation
+        if rotation is None:
+            self._rotation = np.eye(3, dtype=float)
+            return
+        self._rotation = np.asarray(rotation, dtype=float)
+        if self._rotation.shape != (3, 3) or not np.isfinite(self._rotation).all():
+            raise ValueError("leader_to_follower_rotation must be a finite 3x3 rotation matrix.")
+        if not np.allclose(self._rotation.T @ self._rotation, np.eye(3), atol=1e-4) or not np.isclose(
+            np.linalg.det(self._rotation), 1.0, atol=1e-4
+        ):
+            raise ValueError("leader_to_follower_rotation must be a proper 3D rotation matrix.")
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        info = transition.get(TransitionKey.INFO, {})
+        is_intervention = bool(info.get(TeleopEvents.IS_INTERVENTION, False))
+        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
+        leader_action = complementary_data.get(TELEOP_ACTION_KEY)
+
+        if not isinstance(leader_action, dict):
+            self._was_intervening = False
+            return transition
+
+        action_joint_names = self.leader_action_joint_names or self.motor_names
+        try:
+            joints = np.array(
+                [
+                    float(leader_action[f"{name}.pos"])
+                    * float((self.joint_scales or {}).get(name, 1.0))
+                    + float((self.joint_offsets_deg or {}).get(name, 0.0))
+                    for name in action_joint_names
+                ],
+                dtype=float,
+            )
+        except (KeyError, TypeError, ValueError):
+            if is_intervention:
+                return self._with_neutral_action(transition)
+            self._was_intervening = False
+            return transition
+
+        position = np.asarray(self.kinematics.forward_kinematics(joints), dtype=float)[:3, 3]
+        gripper = float(leader_action.get(self.gripper_action_key, 0.0))
+        previous_position = None if self._previous_position is None else self._previous_position.copy()
+
+        if not is_intervention or not self._was_intervening or self._previous_position is None:
+            self._previous_position = position
+            self._previous_gripper = gripper
+            self._was_intervening = is_intervention
+            if is_intervention:
+                result = self._with_neutral_action(transition)
+                state = "intervention_started"
+            else:
+                result = transition
+                state = "intervention_inactive"
+            if self.diagnostics_enabled:
+                update_hil_diagnostics(
+                    result,
+                    "leader",
+                    {
+                        "state": state,
+                        "is_intervention": is_intervention,
+                        "raw_joint_deg": {
+                            name: float(leader_action[f"{name}.pos"]) for name in action_joint_names
+                        },
+                        "kinematic_joint_deg": dict(zip(self.motor_names, joints, strict=True)),
+                        "fk_xyz_m": position,
+                        "previous_fk_xyz_m": previous_position,
+                        "delta_xyz_m": [0.0, 0.0, 0.0],
+                        "normalized_delta_unclipped": [0.0, 0.0, 0.0],
+                        "normalized_delta_clipped": [0.0, 0.0, 0.0],
+                        "gripper_position": gripper,
+                        "gripper_delta": None,
+                        "gripper_action": 1.0 if self.use_gripper else None,
+                    },
+                )
+            return result
+
+        delta = self._rotation @ (position - self._previous_position)
+        self._previous_position = position
+        previous_gripper = self._previous_gripper if self._previous_gripper is not None else gripper
+        self._previous_gripper = gripper
+
+        normalized_delta_unclipped = np.array(
+            [
+                delta[0] / self.end_effector_step_sizes["x"],
+                delta[1] / self.end_effector_step_sizes["y"],
+                delta[2] / self.end_effector_step_sizes["z"],
+            ]
+        )
+        normalized_delta = np.clip(normalized_delta_unclipped, -1.0, 1.0)
+        action: dict[str, float] = {
+            "delta_x": float(normalized_delta[0]),
+            "delta_y": float(normalized_delta[1]),
+            "delta_z": float(normalized_delta[2]),
+        }
+        if self.use_gripper:
+            gripper_delta = gripper - previous_gripper
+            is_opening = (
+                gripper_delta > self.gripper_deadband
+                if self.gripper_open_on_positive_delta
+                else gripper_delta < -self.gripper_deadband
+            )
+            if is_opening:
+                action[GRIPPER_KEY] = 2.0
+            elif abs(gripper_delta) > self.gripper_deadband:
+                action[GRIPPER_KEY] = 0.0
+            else:
+                action[GRIPPER_KEY] = 1.0
+
+        new_transition = transition.copy()
+        new_complementary_data = dict(complementary_data)
+        new_complementary_data[TELEOP_ACTION_KEY] = action
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = new_complementary_data
+        if self.diagnostics_enabled:
+            update_hil_diagnostics(
+                new_transition,
+                "leader",
+                {
+                    "state": "intervening",
+                    "is_intervention": True,
+                    "raw_joint_deg": {
+                        name: float(leader_action[f"{name}.pos"]) for name in action_joint_names
+                    },
+                    "kinematic_joint_deg": dict(zip(self.motor_names, joints, strict=True)),
+                    "fk_xyz_m": position,
+                    "previous_fk_xyz_m": previous_position,
+                    "delta_xyz_m": delta,
+                    "normalized_delta_unclipped": normalized_delta_unclipped,
+                    "normalized_delta_clipped": normalized_delta,
+                    "clipped_axes": [
+                        axis
+                        for axis, raw, clipped in zip(
+                            ("x", "y", "z"), normalized_delta_unclipped, normalized_delta, strict=True
+                        )
+                        if not np.isclose(raw, clipped)
+                    ],
+                    "gripper_position": gripper,
+                    "gripper_delta": gripper - previous_gripper,
+                    "gripper_action": action.get(GRIPPER_KEY),
+                },
+            )
+        return new_transition
+
+    def _with_neutral_action(self, transition: EnvTransition) -> EnvTransition:
+        action: dict[str, float] = {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0}
+        if self.use_gripper:
+            action[GRIPPER_KEY] = 1.0
+        new_transition = transition.copy()
+        complementary_data = dict(transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+        complementary_data[TELEOP_ACTION_KEY] = action
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        return new_transition
+
+    def reset(self) -> None:
+        self._previous_position = None
+        self._previous_gripper = None
+        self._was_intervening = False
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register("leader_follower_pose_error_action_processor")
+class LeaderFollowerPoseErrorActionProcessorStep(ProcessorStep):
+    """Map leader/follower EE error to the canonical HIL action."""
+
+    leader_kinematics: Any
+    follower_kinematics: Any
+    follower_motor_names: list[str]
+    end_effector_step_sizes: dict[str, float]
+    strategy: str
+    use_gripper: bool = True
+    gripper_deadband: float = 0.5
+    gripper_open_on_positive_delta: bool = True
+    leader_action_joint_names: list[str] | None = None
+    joint_scales: dict[str, float] | None = None
+    joint_offsets_deg: dict[str, float] | None = None
+    leader_to_follower_rotation: list[list[float]] | np.ndarray | None = None
+    gripper_action_key: str = "gripper.pos"
+    direct_joint_mirror: bool = False
+    max_takeover_joint_error_deg: float = 8.0
+    max_takeover_position_error_m: float | None = None
+    rebase_on_intervention: bool = False
+    diagnostics_enabled: bool = False
+
+    _was_intervening: bool = False
+    _previous_gripper: float | None = None
+    _leader_reference_xyz: np.ndarray | None = None
+    _follower_reference_xyz: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        rotation = self.leader_to_follower_rotation
+        self._rotation = np.asarray(np.eye(3) if rotation is None else rotation, dtype=float)
+        if self._rotation.shape != (3, 3) or not np.isfinite(self._rotation).all():
+            raise ValueError("leader_to_follower_rotation must be a finite 3x3 rotation matrix.")
+        if not np.allclose(self._rotation.T @ self._rotation, np.eye(3), atol=1e-4) or not np.isclose(
+            np.linalg.det(self._rotation), 1.0, atol=1e-4
+        ):
+            raise ValueError("leader_to_follower_rotation must be a proper 3D rotation matrix.")
+        if self.strategy not in {"wenruo", "ggand0"}:
+            raise ValueError(f"Unsupported pose-error strategy: {self.strategy}")
+        if self.max_takeover_joint_error_deg <= 0:
+            raise ValueError("max_takeover_joint_error_deg must be positive.")
+        if self.max_takeover_position_error_m is not None and self.max_takeover_position_error_m <= 0:
+            raise ValueError("max_takeover_position_error_m must be positive when configured.")
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        info = transition.get(TransitionKey.INFO, {})
+        is_intervention = bool(info.get(TeleopEvents.IS_INTERVENTION, False))
+        complementary_data = dict(transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+        complementary_data.pop(DIRECT_JOINT_ACTION_KEY, None)
+        transition = transition.copy()
+        transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        raw_leader = complementary_data.get(TELEOP_ACTION_KEY)
+        observation = transition.get(TransitionKey.OBSERVATION) or {}
+        leader_names = self.leader_action_joint_names or self.follower_motor_names
+
+        if not isinstance(raw_leader, dict):
+            self._was_intervening = False
+            return transition
+
+        try:
+            leader_joints = np.array(
+                [
+                    float(raw_leader[f"{name}.pos"]) * float((self.joint_scales or {}).get(name, 1.0))
+                    + float((self.joint_offsets_deg or {}).get(name, 0.0))
+                    for name in leader_names
+                ],
+                dtype=float,
+            )
+            follower_joints = np.array(
+                [float(observation[f"{name}.pos"]) for name in self.follower_motor_names], dtype=float
+            )
+        except (KeyError, TypeError, ValueError):
+            return self._neutral(transition) if is_intervention else transition
+
+        leader_xyz = np.asarray(self.leader_kinematics.forward_kinematics(leader_joints))[:3, 3]
+        follower_xyz = np.asarray(self.follower_kinematics.forward_kinematics(follower_joints))[:3, 3]
+        raw_delta = self._rotation @ (leader_xyz - follower_xyz)
+        normalized = np.clip(
+            raw_delta
+            / np.array(
+                [
+                    self.end_effector_step_sizes["x"],
+                    self.end_effector_step_sizes["y"],
+                    self.end_effector_step_sizes["z"],
+                ]
+            ),
+            -1.0,
+            1.0,
+        )
+        gripper = float(raw_leader.get(self.gripper_action_key, 0.0))
+
+        if is_intervention and not self._was_intervening:
+            self._was_intervening = True
+            self._previous_gripper = gripper
+            if self.rebase_on_intervention:
+                self._leader_reference_xyz = leader_xyz.copy()
+                self._follower_reference_xyz = follower_xyz.copy()
+            return self._neutral(transition)
+        if not is_intervention:
+            self._was_intervening = False
+            self._previous_gripper = gripper
+            self._leader_reference_xyz = None
+            self._follower_reference_xyz = None
+            return transition
+
+        delta = raw_delta
+        if self.rebase_on_intervention:
+            if self._leader_reference_xyz is None or self._follower_reference_xyz is None:
+                self._leader_reference_xyz = leader_xyz.copy()
+                self._follower_reference_xyz = follower_xyz.copy()
+                return self._neutral(transition)
+            delta = self._rotation @ (
+                (leader_xyz - self._leader_reference_xyz) - (follower_xyz - self._follower_reference_xyz)
+            )
+            normalized = np.clip(
+                delta
+                / np.array(
+                    [
+                        self.end_effector_step_sizes["x"],
+                        self.end_effector_step_sizes["y"],
+                        self.end_effector_step_sizes["z"],
+                    ]
+                ),
+                -1.0,
+                1.0,
+            )
+
+        position_error_m = float(np.linalg.norm(delta))
+        if (
+            self.max_takeover_position_error_m is not None
+            and position_error_m > self.max_takeover_position_error_m
+        ):
+            result = self._neutral(transition)
+            if self.diagnostics_enabled:
+                update_hil_diagnostics(
+                    result,
+                    "leader",
+                    {
+                        "strategy": self.strategy,
+                        "is_intervention": True,
+                        "leader_fk_xyz_m": leader_xyz,
+                        "follower_fk_xyz_m": follower_xyz,
+                        "raw_leader_follower_delta_xyz_m": raw_delta,
+                        "delta_xyz_m": delta,
+                        "canonical_action": {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0},
+                        "takeover_position_error_m": position_error_m,
+                        "takeover_position_error_limit_m": self.max_takeover_position_error_m,
+                        "state": "takeover_position_alignment_rejected",
+                    },
+                )
+            return result
+
+        alignment_error = None
+        direct = None
+        if self.direct_joint_mirror:
+            follower_arm_names = [name for name in self.follower_motor_names if name != "gripper"]
+            leader_arm_indices = [
+                index for index, name in enumerate(leader_names) if f"{name}.pos" != self.gripper_action_key
+            ]
+            if len(leader_arm_indices) != len(follower_arm_names):
+                raise ValueError("ggand0 joint mirroring requires matching leader/follower arm joint counts.")
+            mapped_leader_arm = leader_joints[leader_arm_indices]
+            follower_arm = np.array(
+                [float(observation[f"{name}.pos"]) for name in follower_arm_names], dtype=float
+            )
+            alignment_error = float(np.max(np.abs(mapped_leader_arm - follower_arm), initial=0.0))
+            if alignment_error > self.max_takeover_joint_error_deg:
+                result = self._neutral(transition)
+                if self.diagnostics_enabled:
+                    update_hil_diagnostics(
+                        result,
+                        "leader",
+                        {
+                            "strategy": self.strategy,
+                            "is_intervention": True,
+                            "leader_fk_xyz_m": leader_xyz,
+                            "follower_fk_xyz_m": follower_xyz,
+                            "delta_xyz_m": delta,
+                            "canonical_action": {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0},
+                            "direct_joint_execution": False,
+                            "takeover_alignment_error_deg": alignment_error,
+                            "state": "takeover_alignment_rejected",
+                        },
+                    )
+                return result
+            direct = {
+                f"{follower}.pos": float(value)
+                for follower, value in zip(follower_arm_names, mapped_leader_arm, strict=True)
+            }
+            if "gripper" in self.follower_motor_names:
+                direct["gripper.pos"] = (
+                    gripper if self.use_gripper else float(observation["gripper.pos"])
+                )
+
+        canonical = {
+            "delta_x": float(normalized[0]),
+            "delta_y": float(normalized[1]),
+            "delta_z": float(normalized[2]),
+        }
+        if self.use_gripper:
+            previous = self._previous_gripper if self._previous_gripper is not None else gripper
+            gripper_delta = gripper - previous
+            opening = (
+                gripper_delta > self.gripper_deadband
+                if self.gripper_open_on_positive_delta
+                else gripper_delta < -self.gripper_deadband
+            )
+            canonical[GRIPPER_KEY] = 2.0 if opening else 0.0 if abs(gripper_delta) > self.gripper_deadband else 1.0
+        self._previous_gripper = gripper
+        complementary_data[TELEOP_ACTION_KEY] = canonical
+        if direct is not None:
+            complementary_data[DIRECT_JOINT_ACTION_KEY] = direct
+
+        result = transition.copy()
+        result[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        if self.diagnostics_enabled:
+            update_hil_diagnostics(
+                result,
+                "leader",
+                {
+                    "strategy": self.strategy,
+                    "is_intervention": True,
+                    "leader_fk_xyz_m": leader_xyz,
+                    "follower_fk_xyz_m": follower_xyz,
+                    "raw_leader_follower_delta_xyz_m": raw_delta,
+                    "delta_xyz_m": delta,
+                    "takeover_position_error_m": position_error_m,
+                    "canonical_action": canonical,
+                    "direct_joint_execution": DIRECT_JOINT_ACTION_KEY in complementary_data,
+                    "takeover_alignment_error_deg": alignment_error,
+                },
+            )
+        return result
+
+    def _neutral(self, transition: EnvTransition) -> EnvTransition:
+        result = transition.copy()
+        complementary_data = dict(transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+        action = {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0}
+        if self.use_gripper:
+            action[GRIPPER_KEY] = 1.0
+        complementary_data[TELEOP_ACTION_KEY] = action
+        complementary_data.pop(DIRECT_JOINT_ACTION_KEY, None)
+        result[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        return result
+
+    def reset(self) -> None:
+        self._was_intervening = False
+        self._previous_gripper = None
+        self._leader_reference_xyz = None
+        self._follower_reference_xyz = None
+
+    def transform_features(self, features):
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register("canonical_hil_action_processor")
+class CanonicalHILActionProcessorStep(ProcessorStep):
+    """Validate and normalize the shared XYZ plus discrete-gripper action."""
+
+    use_gripper: bool = True
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        action = transition.get(TransitionKey.ACTION)
+        if not isinstance(action, PolicyAction):
+            raise ValueError("Canonical HIL action must be a torch tensor.")
+        expected = 4 if self.use_gripper else 3
+        if action.shape != (expected,) or not torch.isfinite(action).all():
+            raise ValueError(f"Canonical HIL action must have shape ({expected},) with finite values.")
+        result = transition.copy()
+        canonical = action.to(dtype=torch.float32).clone()
+        canonical[..., :3] = canonical[..., :3].clamp(-1.0, 1.0)
+        if self.use_gripper:
+            canonical[..., 3] = canonical[..., 3].round().clamp(0.0, 2.0)
+        result[TransitionKey.ACTION] = canonical
+        complementary_data = dict(result.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+        complementary_data[TELEOP_ACTION_KEY] = canonical
+        result[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        return result
+
+    def transform_features(self, features):
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register("direct_joint_action_override_processor")
+class DirectJointActionOverrideProcessorStep(ProcessorStep):
+    """Replace the physical command while preserving the canonical stored action."""
+
+    motor_names: list[str]
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        direct = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(DIRECT_JOINT_ACTION_KEY)
+        if not isinstance(direct, dict):
+            return transition
+        action = transition.get(TransitionKey.ACTION)
+        if not isinstance(action, PolicyAction):
+            raise ValueError("Direct joint override expects a tensor robot command.")
+        result = transition.copy()
+        values = []
+        for index, name in enumerate(self.motor_names):
+            key = f"{name}.pos"
+            if key in direct:
+                values.append(direct[key])
+            elif index < action.numel():
+                values.append(action[index])
+            else:
+                raise ValueError(f"Direct joint override is missing a target for '{key}'.")
+        result[TransitionKey.ACTION] = torch.as_tensor(values, dtype=action.dtype, device=action.device)
+        return result
+
+    def transform_features(self, features):
         return features
 
 
@@ -464,6 +1036,12 @@ class InterventionActionProcessorStep(ProcessorStep):
 
     use_gripper: bool = False
     terminate_on_success: bool = True
+    success_label_hold_steps: int = 1
+    _success_steps_remaining: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.success_label_hold_steps < 1:
+            raise ValueError("success_label_hold_steps must be at least 1.")
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """
@@ -486,7 +1064,12 @@ class InterventionActionProcessorStep(ProcessorStep):
         teleop_action = complementary_data.get(TELEOP_ACTION_KEY, {})
         is_intervention = info.get(TeleopEvents.IS_INTERVENTION, False)
         terminate_episode = info.get(TeleopEvents.TERMINATE_EPISODE, False)
-        success = info.get(TeleopEvents.SUCCESS, False)
+        success_event = bool(info.get(TeleopEvents.SUCCESS, False))
+        if success_event:
+            self._success_steps_remaining = self.success_label_hold_steps
+        success = self._success_steps_remaining > 0
+        if self._success_steps_remaining > 0:
+            self._success_steps_remaining -= 1
         rerecord_episode = info.get(TeleopEvents.RERECORD_EPISODE, False)
 
         new_transition = transition.copy()
@@ -540,7 +1123,11 @@ class InterventionActionProcessorStep(ProcessorStep):
         return {
             "use_gripper": self.use_gripper,
             "terminate_on_success": self.terminate_on_success,
+            "success_label_hold_steps": self.success_label_hold_steps,
         }
+
+    def reset(self) -> None:
+        self._success_steps_remaining = 0
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

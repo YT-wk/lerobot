@@ -52,10 +52,13 @@ One can use HIL-SERL to train on a variety of manipulation tasks. Some recommend
 
 ## Install LeRobot with HIL-SERL
 
-To install LeRobot with HIL-SERL, you need to install the `hilserl` extra.
+To install LeRobot with HIL-SERL on an SO101, install the `hilserl`, `feetech`, and
+`pynput-dep` extras. Gamepad teleoperation additionally requires the `gamepad` extra.
 
 ```bash
-pip install -e ".[hilserl]"
+pip install -e ".[hilserl,feetech,pynput-dep]"
+# Required when `env.teleop.type` is `gamepad`.
+pip install -e ".[gamepad]"
 ```
 
 ## Real Robot Training Workflow
@@ -439,8 +442,12 @@ The `Teleoperator` defines the teleoperation device. You can check the list of a
 **Setting up the Gamepad**
 
 The gamepad provides a very convenient way to control the robot and the episode state.
+It produces the same `delta_x`, `delta_y`, `delta_z`, and discrete gripper action used by
+the HIL-SERL policy. It does not receive follower feedback.
 
 To setup the gamepad, you need to set the `control_mode` to `"gamepad"` and define the `teleop` section in the configuration file.
+The complete record-mode template is available at
+`examples/tutorial/rl/hilserl_so101_gamepad_config.json`.
 
 ```json
 {
@@ -475,7 +482,15 @@ To setup the gamepad, you need to set the `control_mode` to `"gamepad"` and defi
 
 The SO101 leader arm has reduced gears that allows it to move and track the follower arm during exploration. Therefore, taking over is much smoother than the gearless SO100.
 
+In leader HIL mode, this tracking is implemented in software: during policy rollouts the
+leader follows the follower's measured joints with a speed limit. Pressing `space` stops
+the feedback loop and disables the leader torque before the human moves it. The human's
+relative end-effector motion is then converted to the same Cartesian delta action used by
+the policy and is solved by the follower IK pipeline.
+
 To setup the SO101 leader, you need to set the `control_mode` to `"leader"` and define the `teleop` section in the configuration file.
+The complete record-mode template is available at
+`examples/tutorial/rl/hilserl_so101_leader_config.json`.
 
 ```json
 {
@@ -487,6 +502,17 @@ To setup the SO101 leader, you need to set the `control_mode` to `"leader"` and 
     },
     "processor": {
       "control_mode": "leader",
+      "leader_follow_max_joint_speed_deg_s": 60.0,
+      "leader_follow_max_gripper_speed": 100.0,
+      "inverse_kinematics": {
+        "urdf_path": "path/to/so101_new_calib.urdf",
+        "target_frame_name": "gripper_frame_link",
+        "end_effector_bounds": {
+          "min": [0.16, -0.08, 0.03],
+          "max": [0.24, 0.20, 0.10]
+        },
+        "end_effector_step_sizes": {"x": 0.01, "y": 0.01, "z": 0.01}
+      },
       "gripper": {
         "use_gripper": true
       }
@@ -497,6 +523,12 @@ To setup the SO101 leader, you need to set the `control_mode` to `"leader"` and 
 
 In order to annotate the success/failure of the episode, **you will need** to use a keyboard to press `s` for success, `esc` for failure.
 During the online training, press `space` to take over the policy and `space` again to give the control back to the policy.
+
+Leader mode requires `robot.type="so101_follower"`, `teleop.type="so101_leader"`,
+`use_degrees=true` on both arms, and a complete inverse-kinematics configuration. The
+leader and follower do not need to have the same pose when intervention starts: the first
+intervention frame is held still, then only the leader's relative Cartesian motion is mapped
+to the follower. Keep an external emergency stop available; `esc` only terminates the software episode.
 
 <details>
 <summary><strong>Video: SO101 leader teleoperation</strong></summary>
@@ -791,6 +823,82 @@ python -m lerobot.rl.gym_manipulator --config_path path/to/env_config.json
 ```
 
 The reward classifier will automatically provide rewards based on the visual input from the robot's cameras.
+
+### SO101 leader control strategies
+
+SO101 reward recording and online actor control share one canonical action:
+`[delta_x, delta_y, delta_z, gripper]`, where XYZ is normalized to `[-1, 1]`
+and gripper is `0=close`, `1=hold`, `2=open`. Select the leader implementation
+without changing the dataset or replay-buffer schema:
+
+```bash
+uv run python -m lerobot.rl.gym_manipulator \
+  --config_path configs/so101_hilserl/reward_record.json \
+  --env.processor.leader_control_strategy=wenruo
+```
+
+- `current` uses consecutive leader FK deltas and URDF/Placo IK.
+- `wenruo` uses leader/follower EE error and the legacy finite-difference IK.
+- `ggand0` records the same Cartesian action, mirrors aligned leader joints during intervention,
+  and uses MuJoCo DLS IK for policy actions. It requires a positive
+  `robot.max_relative_target`; an intervention is held neutral until the arms are within
+  `ggand0_kinematics.max_takeover_joint_error_deg`.
+
+Use the same override for actor and learner commands. Only the actor initializes hardware;
+the learner accepts the field as part of the shared configuration and receives canonical transitions.
+
+| Strategy | Human action source | Physical execution | Optional dependency |
+|---|---|---|---|
+| `current` | Consecutive leader FK displacement | Placo IK | `placo` |
+| `wenruo` | Leader minus follower EE position | Five-step position-only finite-difference IK | None beyond base HIL dependencies |
+| `ggand0` | Leader minus follower MuJoCo EE position | Aligned leader joint target during intervention; MuJoCo DLS IK for policy actions | `mujoco` |
+
+The `ggand0` physical joint target is never stored as the training action. It is routed through
+`robot.send_action()`, so `robot.max_relative_target` still limits each command, while the dataset,
+actor transport, and learner buffers receive only the canonical three-axis action and gripper class.
+The first intervention frame is neutral. If mapped leader and follower arm joints differ by more than
+`max_takeover_joint_error_deg`, subsequent intervention frames also remain neutral until the arms are
+aligned.
+
+The packaged ggand0 model is the complete `so101_new_calib.xml` and STL set from
+[`ggand0/pick-101`](https://github.com/ggand0/pick-101), with its MIT license and source commit retained
+next to the package assets. An external model can be selected with
+`env.processor.ggand0_kinematics.model_path`.
+
+Start actor and learner with the same strategy override:
+
+```bash
+uv run python -m lerobot.rl.learner \
+  --config_path configs/so101_hilserl/actor_learner_train.json \
+  --env.processor.leader_control_strategy=ggand0
+
+uv run python -m lerobot.rl.actor \
+  --config_path configs/so101_hilserl/actor_learner_train.json \
+  --env.processor.leader_control_strategy=ggand0
+```
+
+`current` encodes leader frame-to-frame motion, while `wenruo` and `ggand0` encode instantaneous
+leader/follower position error. Their tensor schema is identical, so reward-classifier datasets can be
+combined, but changing intervention strategy while continuing the same actor/critic run changes the
+human-action distribution. Keep the strategy, joint mapping, frame rotation, and XYZ step sizes fixed
+for a policy training run.
+
+Wenruo's analytic FK uses a different coordinate frame from the URDF/Placo backend. Its safe workspace
+is therefore configured separately in `processor.wenruo_kinematics.end_effector_bounds`; do not copy
+`processor.inverse_kinematics.end_effector_bounds` into that field. With the default
+`wenruo_kinematics.rebase_on_intervention=true`, the first intervention frame captures the current
+leader/follower offset and outputs a neutral action. Subsequent actions track leader displacement from
+that pose, so the arms do not need to begin aligned. The dynamic post-rebase error is limited by
+`wenruo_kinematics.max_takeover_position_error_m` (default: 20 mm). The default per-iteration Jacobian
+update is capped by `max_joint_update_deg` (default: 1 degree). A disabled action always holds the
+measured FK pose and is never workspace-clipped into a movement command.
+
+For real-hardware checkout, first remove payloads and move one joint at a time. Confirm that physical
+motion, FK motion, and canonical XYZ have matching signs. Temporarily reduce each XYZ step size to
+2-3 mm for Cartesian checks. Test ggand0 only after aligning both arms, then deliberately exceed the
+alignment threshold and confirm that no direct target is emitted. Finally, record one short episode per
+strategy and compare the `action` shape, float32 dtype, normalized range, gripper encoding, reward, and
+done fields.
 
 **Example Workflow for training the reward classifier**
 

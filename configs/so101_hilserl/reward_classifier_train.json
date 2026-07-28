@@ -1,0 +1,28 @@
+{
+  "dataset": {
+    "repo_id": "local/so101_reward_classifier",
+    "root": "/home/robot/datasets/so101_reward_classifier",
+    "eval_split": 0.1
+  },
+  "reward_model": {
+    "type": "reward_classifier",
+    "device": "cuda",
+    "model_name": "lerobot/resnet10",
+    "num_cameras": 2,
+    "num_classes": 2,
+    "hidden_dim": 256,
+    "latent_dim": 256,
+    "image_embedding_pooling_dim": 8,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01
+  },
+  "output_dir": "/home/robot/Codes/lerobot/outputs/so101_reward_classifier",
+  "job_name": "so101_reward_classifier",
+  "batch_size": 16,
+  "num_workers": 2,
+  "steps": 10000,
+  "log_freq": 20,
+  "save_freq": 1000,
+  "eval_steps": 100,
+  "wandb": {"enable": false}
+}

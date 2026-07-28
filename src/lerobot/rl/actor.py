@@ -111,6 +111,7 @@ from .gym_manipulator import (
     reset_and_build_transition,
     step_env_and_process_transition,
 )
+from .hil_action import validate_canonical_hil_action
 from .queue import get_last_item_from_queue
 from .train_rl import TrainRLServerPipelineConfig
 
@@ -121,6 +122,9 @@ from .train_rl import TrainRLServerPipelineConfig
 def actor_cli(cfg: TrainRLServerPipelineConfig):
     # Fail fast with a friendly error if the optional ``hilserl`` extra is missing.
     require_package("grpcio", extra="hilserl", import_name="grpc")
+    # The learner owns checkpoint creation. An actor attaches to that same run
+    # directory for logs and must not be rejected once the learner creates it.
+    cfg.allow_existing_output_dir = True
     cfg.validate()
     display_pid = False
     if not use_threads(cfg):
@@ -346,6 +350,8 @@ def act_with_policy(
         # Teleop action is the action that was executed in the environment
         # It is either the action from the teleop device or the action from the policy
         executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
+        use_gripper = cfg.env.processor.gripper is None or cfg.env.processor.gripper.use_gripper
+        validate_canonical_hil_action(executed_action, use_gripper=use_gripper)
 
         reward = new_transition[TransitionKey.REWARD]
         done = new_transition.get(TransitionKey.DONE, False)

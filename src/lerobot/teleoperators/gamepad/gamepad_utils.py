@@ -70,6 +70,11 @@ class InputController:
         """Update controller state - call this once per frame."""
         pass
 
+    @property
+    def is_ready(self) -> bool:
+        """Whether the controller has a usable input device."""
+        return self.running
+
     def __enter__(self):
         """Support for use in 'with' statements."""
         self.start()
@@ -260,6 +265,11 @@ class GamepadController(InputController):
 
     def update(self):
         """Process pygame events to get fresh gamepad readings."""
+        if self.joystick is None or not self.joystick.get_init():
+            self.running = False
+            self.intervention_flag = False
+            return
+
         for event in pygame.event.get():
             if event.type == pygame.JOYBUTTONDOWN:
                 if event.button == 3:
@@ -290,14 +300,14 @@ class GamepadController(InputController):
                 elif event.button == 7:
                     self.open_gripper_command = False
 
-            # Check for RB button (typically button 5) for intervention flag
-            if self.joystick.get_button(5):
-                self.intervention_flag = True
-            else:
-                self.intervention_flag = False
+        # Poll this state every frame. Relying on pygame events can leave an
+        # intervention stuck when a controller release event is dropped.
+        self.intervention_flag = bool(self.joystick.get_button(5))
 
     def get_deltas(self):
         """Get the current movement deltas from gamepad state."""
+        if self.joystick is None or not self.running:
+            return 0.0, 0.0, 0.0
         try:
             # Read joystick axes
             # Left stick X and Y (typically axes 0 and 1)
@@ -398,6 +408,10 @@ class GamepadControllerHID(InputController):
             logging.error(f"Error opening gamepad: {e}")
             logging.error("You might need to run this with sudo/admin privileges on some systems")
             self.running = False
+
+    @property
+    def is_ready(self) -> bool:
+        return self.running and self.device is not None
 
     def stop(self):
         """Close the HID device connection."""
