@@ -85,6 +85,10 @@ class GamepadTeleop(Teleoperator):
 
         self.gamepad = Gamepad()
         self.gamepad.start()
+        if not self.gamepad.is_ready:
+            self.gamepad.stop()
+            self.gamepad = None
+            raise RuntimeError("No usable gamepad was found. Connect a controller and try again.")
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
@@ -163,7 +167,7 @@ class GamepadTeleop(Teleoperator):
     @property
     def is_connected(self) -> bool:
         """Check if gamepad is connected."""
-        return self.gamepad is not None
+        return self.gamepad is not None and self.gamepad.is_ready
 
     def calibrate(self) -> None:
         """Calibrate the gamepad."""

@@ -113,6 +113,7 @@ from .algorithms.base import RLAlgorithm
 from .algorithms.factory import make_algorithm
 from .buffer import ReplayBuffer
 from .data_sources import OnlineOfflineMixer
+from .hil_action import validate_canonical_hil_action
 from .learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
 from .train_rl import TrainRLServerPipelineConfig
 from .trainer import RLTrainer
@@ -384,6 +385,9 @@ def add_actor_information_and_train(
     dataset_repo_id = None
     if cfg.dataset is not None:
         dataset_repo_id = cfg.dataset.repo_id
+    hil_use_gripper = None
+    if cfg.env.type == "gym_manipulator":
+        hil_use_gripper = cfg.env.processor.gripper is None or cfg.env.processor.gripper.use_gripper
 
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     while True:
@@ -399,6 +403,7 @@ def add_actor_information_and_train(
             offline_replay_buffer=offline_replay_buffer,
             dataset_repo_id=dataset_repo_id,
             shutdown_event=shutdown_event,
+            hil_use_gripper=hil_use_gripper,
         )
 
         # Process all available interaction messages sent by the actor server
@@ -949,6 +954,7 @@ def process_transitions(
     offline_replay_buffer: ReplayBuffer,
     dataset_repo_id: str | None,
     shutdown_event: Any,  # Event
+    hil_use_gripper: bool | None = None,
 ):
     """Process all available transitions from the queue.
 
@@ -964,6 +970,14 @@ def process_transitions(
         transition_list = bytes_to_transitions(buffer=transition_list)
 
         for transition in transition_list:
+            if hil_use_gripper is not None:
+                try:
+                    validate_canonical_hil_action(
+                        transition[ACTION], use_gripper=hil_use_gripper
+                    )
+                except ValueError as exc:
+                    logging.warning("[LEARNER] Invalid canonical HIL action, skipping: %s", exc)
+                    continue
             # Skip transitions with NaN values
             if check_nan_in_transition(
                 observations=transition["state"],

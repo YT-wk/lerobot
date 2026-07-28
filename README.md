@@ -64,6 +64,79 @@ While these devices are natively integrated into the LeRobot codebase, the libra
 
 For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
 
+## SO-101 HIL-SERL Extension
+
+This checkout extends LeRobot's HIL-SERL workflow for a real SO-101 follower arm with either an SO-101 leader arm or a gamepad. It is intended for collecting corrective interventions, recording reward-classifier data, and running online SAC actor/learner training while keeping the learning interface independent of the physical control backend.
+
+### What is included
+
+- A single training action contract: `[delta_x, delta_y, delta_z, gripper]` as a `float32` tensor. Cartesian values are normalized to `[-1, 1]`; gripper values are `0=close`, `1=hold`, and `2=open`.
+- Three leader-arm control strategies: `current` for frame-to-frame leader FK motion, `wenruo` for leader/follower pose-error control with finite-difference IK, and `ggand0` for MuJoCo DLS IK with aligned leader-joint mirroring during intervention.
+- SO-101 leader policy tracking, so the leader can follow the follower during autonomous policy execution. Press `Space` to take over and press it again to return control to the policy.
+- A packaged `ggand0/pick-101` MuJoCo SO-101 model with retained license and source metadata, plus an override for an external model.
+- Safety-aware Cartesian bounds, per-command robot target limiting, takeover alignment/error thresholds, home/reset handling, and gamepad disconnect handling.
+- Line-buffered JSONL diagnostics for each real-robot control step, including leader motion, IK residuals, requested and sent targets, command clipping, tracking error, and timing.
+
+### Installation
+
+Install the HIL-SERL, SO-101 motor, and keyboard dependencies. The `hilserl` extra includes the MuJoCo dependency required by the `ggand0` strategy.
+
+```bash
+uv sync --extra hilserl --extra feetech --extra pynput-dep
+# Also required when using env.teleop.type=gamepad.
+uv sync --extra gamepad
+```
+
+### Configuration templates
+
+The following templates live in [`configs/so101_hilserl`](./configs/so101_hilserl) and are deliberately local-first: they do not push datasets or models to the Hub by default.
+
+| Template | Purpose |
+| --- | --- |
+| `expert_demo_record.json` | Record initial expert demonstrations with leader intervention and policy tracking disabled. |
+| `reward_record.json` | Collect success/failure-labelled episodes for the visual reward classifier; diagnostics are enabled. |
+| `reward_classifier_train.json` | Train the two-camera reward classifier. |
+| `actor_learner_train.json` | Configure online/offline SAC training and its actor/learner transport. |
+
+Before running any template, change its robot and camera ports, dataset/output paths, URDF path, camera backend, workspace limits, and model/checkpoint paths for the local robot. The templates assume `use_degrees=true` for both SO-101 arms and `robot.max_relative_target=2.0`; preserve a conservative relative-target limit during initial hardware checks.
+
+### Choosing a leader strategy
+
+All strategies record and transport the same canonical action, so replay-buffer and dataset schemas do not change. Keep the strategy, joint mapping, frame rotation, and Cartesian step sizes fixed within one policy-training run because the intervention distribution does change.
+
+| Strategy | Human-action source | Physical execution | Dependency |
+| --- | --- | --- | --- |
+| `current` | Consecutive leader FK displacement | URDF/Placo IK | `placo` |
+| `wenruo` | Leader/follower end-effector position error | Finite-difference position-only IK | Base HIL dependencies |
+| `ggand0` | Leader/follower MuJoCo end-effector position error | Aligned leader-joint target during intervention; MuJoCo DLS IK for policy actions | `mujoco` |
+
+With `ggand0`, physical joint targets are sent only to the robot and are never stored as training actions. The first takeover frame is neutral; further intervention remains neutral until the leader/follower joint error is within `ggand0_kinematics.max_takeover_joint_error_deg`. With `wenruo`, the initial intervention can rebase the leader/follower offset, and its distinct FK frame requires its own `wenruo_kinematics.end_effector_bounds`.
+
+### Typical workflow
+
+```bash
+# 1. Record demonstrations or labelled reward-classifier episodes.
+uv run python -m lerobot.rl.gym_manipulator \
+  --config_path configs/so101_hilserl/expert_demo_record.json
+
+# 2. Train the reward classifier after labelling/curating its dataset.
+uv run lerobot-train \
+  --config_path configs/so101_hilserl/reward_classifier_train.json
+
+# 3. Start learner and actor with the same control strategy.
+uv run python -m lerobot.rl.learner \
+  --config_path configs/so101_hilserl/actor_learner_train.json \
+  --env.processor.leader_control_strategy=ggand0
+
+uv run python -m lerobot.rl.actor \
+  --config_path configs/so101_hilserl/actor_learner_train.json \
+  --env.processor.leader_control_strategy=ggand0
+```
+
+During a leader-controlled run, `Space` enables/disables intervention, `S` labels success, and `Esc` ends the software episode. `Esc` is not an emergency stop. Keep an external emergency stop available, remove payloads for first motion tests, reduce Cartesian step sizes to 2-3 mm, and verify the signs of physical motion, FK motion, and canonical XYZ one joint at a time.
+
+For the complete HIL-SERL reference, including all processor fields, setup guidance, and strategy-specific checkout procedure, see [`docs/source/hilserl.mdx`](./docs/source/hilserl.mdx).
+
 ## LeRobot Dataset
 
 To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.

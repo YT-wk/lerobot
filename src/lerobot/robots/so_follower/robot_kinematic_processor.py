@@ -32,6 +32,7 @@ from lerobot.processor import (
     RobotObservation,
     TransitionKey,
 )
+from lerobot.processor.hil_diagnostics import update_hil_diagnostics
 from lerobot.utils.rotation import Rotation
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ class EEReferenceAndDelta(RobotActionProcessorStep):
         True  # If True, latch reference on enable; if False, always use current pose
     )
     use_ik_solution: bool = False
+    diagnostics_enabled: bool = False
 
     reference_ee_pose: np.ndarray | None = field(default=None, init=False, repr=False)
     _prev_enabled: bool = field(default=False, init=False, repr=False)
@@ -152,6 +154,34 @@ class EEReferenceAndDelta(RobotActionProcessorStep):
         action["ee.wy"] = float(tw[1])
         action["ee.wz"] = float(tw[2])
         action["ee.gripper_vel"] = gripper_vel
+        # Safety bounds are defined for a kinematics frame. A disabled command
+        # must hold the measured pose exactly, even when that pose lies outside
+        # a different backend's configured workspace.
+        action["ee.enabled"] = enabled
+
+        if self.diagnostics_enabled:
+            update_hil_diagnostics(
+                self.transition,
+                "follower_reference",
+                {
+                    "measured_joint_deg": dict(zip(self.motor_names, q_raw, strict=False)),
+                    "measured_fk_xyz_m": t_curr[:3, 3],
+                    "measured_fk_rotvec_rad": Rotation.from_matrix(t_curr[:3, :3]).as_rotvec(),
+                    "enabled": enabled,
+                    "normalized_delta_command": [tx, ty, tz],
+                    "scaled_delta_xyz_m": [
+                        tx * self.end_effector_step_sizes["x"],
+                        ty * self.end_effector_step_sizes["y"],
+                        tz * self.end_effector_step_sizes["z"],
+                    ],
+                    "rotation_delta_rotvec_rad": [wx, wy, wz],
+                    "reference_xyz_m": ref[:3, 3] if enabled else None,
+                    "desired_xyz_m": pos,
+                    "desired_rotvec_rad": tw,
+                    "use_latched_reference": self.use_latched_reference,
+                    "use_ik_solution": self.use_ik_solution,
+                },
+            )
 
         self._prev_enabled = enabled
         return action
@@ -208,6 +238,7 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
     end_effector_bounds: dict
     max_ee_step_m: float = 0.05
     raise_on_jump: bool = True
+    diagnostics_enabled: bool = False
     _last_pos: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def action(self, action: RobotAction) -> RobotAction:
@@ -217,6 +248,7 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
         wx = action["ee.wx"]
         wy = action["ee.wy"]
         wz = action["ee.wz"]
+        enabled = bool(action.pop("ee.enabled", True))
         # TODO(Steven): ee.gripper_vel does not need to be bounded
 
         if None in (x, y, z, wx, wy, wz):
@@ -224,17 +256,28 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
                 "Missing required end-effector pose components: x, y, z, wx, wy, wz must all be present in action"
             )
 
-        pos = np.array([x, y, z], dtype=float)
+        requested_pos = np.array([x, y, z], dtype=float)
+        previous_target_pos = None if self._last_pos is None else self._last_pos.copy()
         twist = np.array([wx, wy, wz], dtype=float)
 
-        # Clip position
-        pos = np.clip(pos, self.end_effector_bounds["min"], self.end_effector_bounds["max"])
+        # A disabled action represents a hold, never an implicit move into the
+        # workspace. This is particularly important when switching FK backends.
+        workspace_bounded_pos = (
+            np.clip(requested_pos, self.end_effector_bounds["min"], self.end_effector_bounds["max"])
+            if enabled
+            else requested_pos.copy()
+        )
+        pos = workspace_bounded_pos.copy()
+        requested_step_m = 0.0
+        rate_limited = False
 
         # Check for jumps in position
-        if self._last_pos is not None:
+        if enabled and self._last_pos is not None:
             dpos = pos - self._last_pos
             n = float(np.linalg.norm(dpos))
+            requested_step_m = n
             if n > self.max_ee_step_m and n > 0:
+                rate_limited = True
                 # Clamp the step to the per-frame limit (rate-limit). The clamped
                 # value is computed either way; raise_on_jump only decides whether
                 # an over-limit step aborts the loop or is rate-limited + warned.
@@ -257,6 +300,28 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
         action["ee.wx"] = float(twist[0])
         action["ee.wy"] = float(twist[1])
         action["ee.wz"] = float(twist[2])
+        if self.diagnostics_enabled:
+            update_hil_diagnostics(
+                self.transition,
+                "ee_safety",
+                {
+                    "requested_xyz_m": requested_pos,
+                    "workspace_bounded_xyz_m": workspace_bounded_pos,
+                    "final_xyz_m": pos,
+                    "control_enabled": enabled,
+                    "workspace_clipped_axes": [
+                        axis
+                        for axis, requested, bounded in zip(
+                            ("x", "y", "z"), requested_pos, workspace_bounded_pos, strict=True
+                        )
+                        if not np.isclose(requested, bounded)
+                    ],
+                    "previous_target_xyz_m": previous_target_pos,
+                    "requested_step_m": requested_step_m,
+                    "rate_limited": rate_limited,
+                    "max_ee_step_m": self.max_ee_step_m,
+                },
+            )
         return action
 
     def reset(self):
@@ -327,7 +392,6 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
         else:  # Use previous ik solution as initial guess
             if self.q_curr is None:
                 self.q_curr = q_raw
-
         # Build desired 4x4 transform from pos + rotvec (twist)
         t_des = np.eye(4, dtype=float)
         t_des[:3, :3] = Rotation.from_rotvec([wx, wy, wz]).as_matrix()
@@ -562,6 +626,7 @@ class InverseKinematicsRLStep(ProcessorStep):
     motor_names: list[str]
     q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
     initial_guess_current_joints: bool = True
+    diagnostics_enabled: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         new_transition = dict(transition)
@@ -587,10 +652,12 @@ class InverseKinematicsRLStep(ProcessorStep):
         if observation is None:
             raise ValueError("Joints observation is require for computing robot kinematics")
 
-        q_raw = np.array(
-            [float(v) for k, v in observation.items() if isinstance(k, str) and k.endswith(".pos")],
-            dtype=float,
-        )
+        observed_joint_items = [
+            (k.removesuffix(".pos"), float(v))
+            for k, v in observation.items()
+            if isinstance(k, str) and k.endswith(".pos")
+        ]
+        q_raw = np.array([value for _, value in observed_joint_items], dtype=float)
         if q_raw is None:
             raise ValueError("Joints observation is require for computing robot kinematics")
 
@@ -599,6 +666,7 @@ class InverseKinematicsRLStep(ProcessorStep):
         else:  # Use previous ik solution as initial guess
             if self.q_curr is None:
                 self.q_curr = q_raw
+        q_seed = self.q_curr.copy()
 
         # Build desired 4x4 transform from pos + rotvec (twist)
         t_des = np.eye(4, dtype=float)
@@ -620,6 +688,34 @@ class InverseKinematicsRLStep(ProcessorStep):
         complementary_data = new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
         complementary_data["IK_solution"] = q_target
         new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        if self.diagnostics_enabled:
+            achieved_pose = self.kinematics.forward_kinematics(q_target)
+            rotation_error = Rotation.from_matrix(
+                achieved_pose[:3, :3].T @ t_des[:3, :3]
+            ).as_rotvec()
+            update_hil_diagnostics(
+                new_transition,
+                "inverse_kinematics",
+                {
+                    "observed_joint_order": [name for name, _ in observed_joint_items],
+                    "measured_joint_deg": dict(observed_joint_items),
+                    "initial_guess_joint_deg": dict(zip(self.motor_names, q_seed, strict=False)),
+                    "target_xyz_m": t_des[:3, 3],
+                    "target_rotvec_rad": [wx, wy, wz],
+                    "solution_joint_deg": dict(zip(self.motor_names, q_target, strict=False)),
+                    "solution_minus_measured_deg": dict(
+                        zip(self.motor_names, q_target - q_raw, strict=False)
+                    ),
+                    "achieved_xyz_m": achieved_pose[:3, 3],
+                    "position_residual_m": float(
+                        np.linalg.norm(achieved_pose[:3, 3] - t_des[:3, 3])
+                    ),
+                    "orientation_residual_rad": float(np.linalg.norm(rotation_error)),
+                    "initial_guess_current_joints": self.initial_guess_current_joints,
+                    "position_weight": 1.0,
+                    "orientation_weight": 0.01,
+                },
+            )
         return new_transition
 
     def transform_features(

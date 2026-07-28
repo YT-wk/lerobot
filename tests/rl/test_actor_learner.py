@@ -66,6 +66,67 @@ def create_test_interactions(count: int = 3) -> list[dict]:
     return interactions
 
 
+@pytest.mark.parametrize("strategy", ["current", "wenruo", "ggand0"])
+def test_hil_strategies_keep_the_same_canonical_action_through_learner_buffer(strategy):
+    from lerobot.rl.learner import process_transitions
+    from lerobot.teleoperators.utils import TeleopEvents
+    from lerobot.transport.utils import transitions_to_bytes
+
+    class TestQueue:
+        def __init__(self, item):
+            self.items = [item]
+
+        def empty(self):
+            return not self.items
+
+        def get(self):
+            return self.items.pop(0)
+
+    class TestBuffer:
+        def __init__(self):
+            self.transitions = []
+
+        def add(self, **transition):
+            self.transitions.append(transition)
+
+    class Running:
+        @staticmethod
+        def is_set():
+            return False
+
+    action = torch.tensor([0.25, -0.5, 1.0, 2.0], dtype=torch.float32)
+    transition = Transition(
+        state={OBS_STR: torch.zeros(3, 8, 8), "state": torch.zeros(6)},
+        action=action,
+        reward=torch.tensor(0.0),
+        done=torch.tensor(False),
+        truncated=torch.tensor(False),
+        next_state={OBS_STR: torch.zeros(3, 8, 8), "state": torch.zeros(6)},
+        complementary_info={
+            TeleopEvents.IS_INTERVENTION.value: True,
+            "leader_control_strategy": strategy,
+        },
+    )
+    online = TestBuffer()
+    offline = TestBuffer()
+
+    process_transitions(
+        transition_queue=TestQueue(transitions_to_bytes([transition])),
+        replay_buffer=online,
+        offline_replay_buffer=offline,
+        dataset_repo_id="local/test",
+        shutdown_event=Running(),
+        hil_use_gripper=True,
+    )
+
+    assert len(online.transitions) == 1
+    assert len(offline.transitions) == 1
+    assert online.transitions[0][ACTION].dtype == torch.float32
+    assert online.transitions[0][ACTION].shape == (4,)
+    assert torch.equal(online.transitions[0][ACTION], action)
+    assert online.transitions[0]["complementary_info"][TeleopEvents.IS_INTERVENTION.value]
+
+
 def find_free_port():
     """Finds a free port on the local machine."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

@@ -17,6 +17,7 @@ from __future__ import annotations
 import abc
 import importlib
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from typing import Any
 
 import draccus
@@ -285,6 +286,81 @@ class ResetConfig:
     reset_time_s: float = 5.0
     control_time_s: float = 20.0
     terminate_on_success: bool = True
+    capture_initial_joint_positions: bool = False
+    initial_position_settle_time_s: float = 2.0
+    initial_position_max_delta_deg: float = 0.5
+    leader_home_timeout_s: float = 15.0
+    # Number of control steps to retain a manual success label after `S`.
+    # This is useful when recording reward-classifier data with
+    # terminate_on_success=False.
+    success_label_hold_steps: int = 1
+
+
+@dataclass
+class LeaderKinematicsConfig:
+    """Leader-specific FK and frame mapping for Cartesian HIL intervention."""
+
+    urdf_path: str | None = None
+    target_frame_name: str | None = None
+    action_joint_names: list[str] = field(default_factory=list)
+    kinematic_joint_names: list[str] = field(default_factory=list)
+    joint_scales: dict[str, float] = field(default_factory=dict)
+    joint_offsets_deg: dict[str, float] = field(default_factory=dict)
+    leader_to_follower_rotation: list[list[float]] = field(
+        default_factory=lambda: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    gripper_action_key: str = "gripper.pos"
+    gripper_deadband: float = 0.5
+    kinematics_verified: bool = False
+
+
+@dataclass
+class WenruoKinematicsConfig:
+    """Configuration for the legacy analytic SO101 kinematics backend."""
+
+    robot_model: str = "so_new_calibration"
+    frame: str = "gripper_tip"
+    max_iterations: int = 5
+    learning_rate: float = 1.0
+    position_tolerance_m: float = 0.005
+    # These are expressed in the analytic Wenruo FK frame, not the URDF/Placo frame.
+    end_effector_bounds: dict[str, list[float]] = field(
+        default_factory=lambda: {
+            "min": [0.15, -0.25, 0.10],
+            "max": [0.50, 0.25, 0.45],
+        }
+    )
+    max_joint_update_deg: float = 1.0
+    max_takeover_position_error_m: float = 0.02
+    rebase_on_intervention: bool = True
+
+
+@dataclass
+class GGand0KinematicsConfig:
+    """Configuration for the MuJoCo DLS backend and joint-mirror takeover."""
+
+    model_path: str | None = None
+    end_effector_site: str = "gripperframe"
+    ik_damping: float = 0.1
+    ik_max_dq_rad: float = 0.5
+    locked_joints: list[int] = field(default_factory=list)
+    locked_joint_positions_deg: dict[str, float] = field(default_factory=dict)
+    max_takeover_joint_error_deg: float = 8.0
+
+
+class LeaderControlStrategy(str, Enum):  # noqa: UP042 - draccus cannot decode StrEnum here.
+    CURRENT = "current"
+    WENRUO = "wenruo"
+    GGAND0 = "ggand0"
+
+
+@dataclass
+class HILDiagnosticsConfig:
+    """Persistent diagnostics for the real-robot HIL control pipeline."""
+
+    enabled: bool = False
+    log_dir: str = "outputs/hil_diagnostics"
+    console_summary: bool = True
 
 
 @dataclass
@@ -292,6 +368,18 @@ class HILSerlProcessorConfig:
     """Configuration for environment processing pipeline."""
 
     control_mode: str = "gamepad"
+    leader_control_strategy: LeaderControlStrategy = LeaderControlStrategy.CURRENT
+    # Existing SO101 behavior follows the policy by default. Hardware-specific
+    # configs can explicitly leave this false for passive leader intervention.
+    leader_policy_tracking_enabled: bool = True
+    leader_follow_max_joint_speed_deg_s: float = 60.0
+    leader_follow_max_gripper_speed: float = 100.0
+    # Maps the sign of the physical leader gripper encoder into the HIL action
+    # convention: 0=close, 1=stay, 2=open.
+    leader_gripper_open_on_positive_delta: bool = True
+    leader_kinematics: LeaderKinematicsConfig | None = None
+    wenruo_kinematics: WenruoKinematicsConfig = field(default_factory=WenruoKinematicsConfig)
+    ggand0_kinematics: GGand0KinematicsConfig = field(default_factory=GGand0KinematicsConfig)
     observation: ObservationConfig | None = None
     image_preprocessing: ImagePreprocessingConfig | None = None
     gripper: GripperConfig | None = None
@@ -299,6 +387,7 @@ class HILSerlProcessorConfig:
     inverse_kinematics: InverseKinematicsConfig | None = None
     reward_classifier: RewardClassifierConfig | None = None
     max_gripper_pos: float | None = 100.0
+    diagnostics: HILDiagnosticsConfig = field(default_factory=HILDiagnosticsConfig)
 
 
 @EnvConfig.register_subclass(name="gym_manipulator")
@@ -311,6 +400,48 @@ class HILSerlRobotEnvConfig(EnvConfig):
     processor: HILSerlProcessorConfig = field(default_factory=HILSerlProcessorConfig)
 
     name: str = "real_robot"
+
+    def __post_init__(self) -> None:
+        """Build the policy feature contract without connecting to hardware."""
+        use_gripper = self.processor.gripper is None or self.processor.gripper.use_gripper
+        action_dim = 4 if use_gripper else 3
+        configured_action = self.features.get(ACTION)
+        if configured_action is not None and configured_action.shape != (action_dim,):
+            raise ValueError(
+                f"HIL action feature must have shape ({action_dim},), got {configured_action.shape}."
+            )
+        self.features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,))
+        self.features_map[ACTION] = ACTION
+
+        if self.robot is None:
+            return
+
+        # SO101 exposes five arm joints plus the gripper in observation.state.
+        # Other robot types can provide explicit features when their state size differs.
+        if self.robot.type == "so101_follower":
+            self.features.setdefault("agent_pos", PolicyFeature(type=FeatureType.STATE, shape=(6,)))
+            self.features_map.setdefault("agent_pos", OBS_STATE)
+
+        cameras = getattr(self.robot, "cameras", {}) or {}
+        resize_size = (
+            self.processor.image_preprocessing.resize_size
+            if self.processor.image_preprocessing is not None
+            else None
+        )
+        for camera_name, camera_config in cameras.items():
+            if resize_size is not None:
+                height, width = resize_size
+            else:
+                height = getattr(camera_config, "height", None)
+                width = getattr(camera_config, "width", None)
+            if height is None or width is None:
+                continue
+            raw_key = f"pixels/{camera_name}"
+            self.features.setdefault(
+                raw_key,
+                PolicyFeature(type=FeatureType.VISUAL, shape=(int(height), int(width), 3)),
+            )
+            self.features_map.setdefault(raw_key, f"{OBS_IMAGES}.{camera_name}")
 
     @property
     def gym_kwargs(self) -> dict:
